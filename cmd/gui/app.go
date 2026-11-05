@@ -1970,7 +1970,10 @@ func (app *DesktopApp) renderDomainScorecard(c *ui.Context, t *ui.Theme, info *a
 	tlsHeadline := "No HTTPS"
 	tlsTone := toneDanger
 	if info.TLS.HasTLS {
-		if info.TLS.Grade != "" {
+		if info.TLS.InterceptionDetected {
+			tlsHeadline = "Intercepted [" + info.TLS.InterceptionVendor + "]"
+			tlsTone = toneWarning
+		} else if info.TLS.Grade != "" {
 			tlsHeadline = "TLS Grade " + info.TLS.Grade
 			switch info.TLS.Grade {
 			case "A+", "A":
@@ -2094,7 +2097,10 @@ func (app *DesktopApp) renderIPScorecard(c *ui.Context, t *ui.Theme, info *analy
 	tlsHeadline := "No HTTPS (:443)"
 	tlsTone := toneNeutral
 	if info.TLS.HasTLS {
-		if info.TLS.Grade != "" {
+		if info.TLS.InterceptionDetected {
+			tlsHeadline = "Intercepted [" + info.TLS.InterceptionVendor + "]"
+			tlsTone = toneWarning
+		} else if info.TLS.Grade != "" {
 			tlsHeadline = "TLS Grade " + info.TLS.Grade
 			if info.TLS.Grade == "A+" || info.TLS.Grade == "A" {
 				tlsTone = toneSuccess
@@ -2783,6 +2789,9 @@ func (app *DesktopApp) renderTLSGradingCard(c *ui.Context, t *ui.Theme, scanID i
 			if tlsInfo == nil || !tlsInfo.HasTLS {
 				ui.Text(c, "No TLS service detected on port 443.").FontSize(app.fs(12)).TextColor(t.TextMuted)
 			} else {
+				if tlsInfo.InterceptionDetected {
+					app.renderStatusPill(c, t, "INTERCEPTED ("+tlsInfo.InterceptionVendor+")", toneWarning)
+				}
 				if tlsInfo.Grade != "" {
 					app.renderStatusPill(c, t, "Grade: "+tlsInfo.Grade, tlsGradeTone(tlsInfo.Grade))
 				}
@@ -2824,6 +2833,21 @@ func (app *DesktopApp) renderTLSGradingCard(c *ui.Context, t *ui.Theme, scanID i
 			return
 		}
 
+		if tlsInfo.InterceptionDetected {
+			ui.Box(c).FillWidth().Padding(10).Radius(6).Border(1, t.Warning).Children(func() {
+				ui.Column(c).FillWidth().Gap(4).Children(func() {
+					ui.Row(c).Gap(6).AlignItems(ui.Center).Wrap().Children(func() {
+						app.renderStatusPill(c, t, "⚠️ Enterprise TLS Interception Active", toneWarning)
+						ui.Text(c, "Detected Proxy: "+tlsInfo.InterceptionVendor).FontSize(app.fs(12)).Bold().TextColor(t.Warning)
+					})
+					if tlsInfo.InterceptionDetails != "" {
+						ui.Text(c, tlsInfo.InterceptionDetails).FontSize(app.fs(11)).TextColor(t.Text)
+					}
+					ui.Text(c, "The certificate inspected below was re-signed on the fly by your corporate security client. ReconnaScan queried Certificate Transparency (CT) to retrieve the website's real origin certificate.").FontSize(app.fs(11)).TextColor(t.TextMuted)
+				})
+			})
+		}
+
 		if tlsInfo.GradeSummary != "" {
 			app.renderKeyValue(c, t, "TLS Grade Summary", fmt.Sprintf("[%s] %s", tlsInfo.Grade, tlsInfo.GradeSummary))
 		}
@@ -2860,6 +2884,9 @@ func (app *DesktopApp) renderTLSGradingCard(c *ui.Context, t *ui.Theme, scanID i
 		if tlsInfo.SubjectCN != "" {
 			app.renderKeyValue(c, t, "Certificate Subject", tlsInfo.SubjectCN)
 		}
+		if tlsInfo.InterceptionDetected {
+			app.renderKeyValue(c, t, "Inspection Proxy", fmt.Sprintf("%s (Issuer: %s)", tlsInfo.InterceptionVendor, tlsInfo.TLSIssuer))
+		}
 		app.renderKeyValue(c, t, "TLS Issuer", tlsInfo.TLSIssuer)
 		if tlsInfo.ValidFrom != "" {
 			app.renderKeyValue(c, t, "Validity Window", fmt.Sprintf("%s → %s", tlsInfo.ValidFrom, tlsInfo.TLSExpiry))
@@ -2892,6 +2919,47 @@ func (app *DesktopApp) renderTLSGradingCard(c *ui.Context, t *ui.Theme, scanID i
 				for i := 0; i < count; i++ {
 					app.renderPivotActionRow(c, t, scanID, "", tlsInfo.SANDomains[i], "TLS SAN")
 				}
+			})
+		}
+
+		if tlsInfo.PublicCTCert != nil {
+			ui.Box(c).FillWidth().Padding(10).Radius(6).Background(t.Background).Border(1, t.Border).Children(func() {
+				ui.Column(c).FillWidth().Gap(6).Children(func() {
+					ui.Row(c).FillWidth().Gap(8).AlignItems(ui.Center).Wrap().Children(func() {
+						ui.Text(c, "Real Origin Certificate (Certificate Transparency)").FontSize(app.fs(13)).Bold().TextColor(t.Text)
+						app.renderStatusPill(c, t, "CT Log: "+tlsInfo.PublicCTCert.Source, toneInfo)
+						if tlsInfo.PublicCTCert.DaysRemaining > 0 {
+							app.renderStatusPill(c, t, fmt.Sprintf("%d Days Remaining", tlsInfo.PublicCTCert.DaysRemaining), toneSuccess)
+						} else if tlsInfo.PublicCTCert.ValidTo != "" {
+							app.renderStatusPill(c, t, "Expired", toneDanger)
+						}
+					})
+					originIssuer := tlsInfo.PublicCTCert.IssuerOrg
+					if tlsInfo.PublicCTCert.Issuer != "" && tlsInfo.PublicCTCert.Issuer != tlsInfo.PublicCTCert.IssuerOrg {
+						originIssuer += fmt.Sprintf(" (%s)", tlsInfo.PublicCTCert.Issuer)
+					}
+					app.renderKeyValue(c, t, "Origin Issuer", originIssuer)
+					if tlsInfo.PublicCTCert.SubjectCN != "" {
+						app.renderKeyValue(c, t, "Origin Common Name", tlsInfo.PublicCTCert.SubjectCN)
+					}
+					if tlsInfo.PublicCTCert.ValidFrom != "" && tlsInfo.PublicCTCert.ValidTo != "" {
+						app.renderKeyValue(c, t, "Origin Validity", fmt.Sprintf("%s → %s", tlsInfo.PublicCTCert.ValidFrom, tlsInfo.PublicCTCert.ValidTo))
+					}
+					if tlsInfo.PublicCTCert.SerialNumber != "" {
+						app.renderKeyValue(c, t, "Origin Serial", tlsInfo.PublicCTCert.SerialNumber)
+					}
+					if len(tlsInfo.PublicCTCert.SANDomains) > 0 {
+						ctSanKey := fmt.Sprintf("tls-ct-sans:%d", scanID)
+						ui.Text(c, fmt.Sprintf("Origin SAN Domains (%d):", len(tlsInfo.PublicCTCert.SANDomains))).
+							FontSize(app.fs(12)).
+							TextColor(t.TextMuted)
+						app.renderTruncatedList(c, t, ctSanKey, len(tlsInfo.PublicCTCert.SANDomains), 6, "Origin SANs", func(count int) {
+							for i := 0; i < count; i++ {
+								app.renderPivotActionRow(c, t, scanID, "", tlsInfo.PublicCTCert.SANDomains[i], "Public CT SAN")
+							}
+						})
+					}
+				})
 			})
 		}
 	})

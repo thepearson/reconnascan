@@ -7,15 +7,120 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/asn1"
+	"encoding/json"
 	"fmt"
+	"io"
 	"math"
 	"net"
+	"net/http"
+	"net/url"
+	"sort"
 	"strings"
 	"sync"
 	"time"
+
+	"golang.org/x/net/publicsuffix"
 )
 
 var oidCertTransparencySCT = asn1.ObjectIdentifier{1, 3, 6, 1, 4, 1, 11129, 2, 4, 2}
+
+type interceptionSignature struct {
+	vendor   string
+	keywords []string
+}
+
+var knownInterceptionSignatures = []interceptionSignature{
+	{vendor: "Netskope", keywords: []string{"netskope", "goskope", "ca.goskope.com"}},
+	{vendor: "Zscaler", keywords: []string{"zscaler"}},
+	{vendor: "Palo Alto Networks", keywords: []string{"palo alto", "pan-os", "globalprotect"}},
+	{vendor: "Fortinet", keywords: []string{"fortinet", "fortigate", "fortiproxy"}},
+	{vendor: "Blue Coat / Symantec", keywords: []string{"blue coat", "bluecoat", "proxysg", "symantec web gateway", "bcsi"}},
+	{vendor: "Cisco Umbrella", keywords: []string{"cisco umbrella", "opendns"}},
+	{vendor: "Check Point", keywords: []string{"check point", "checkpoint"}},
+	{vendor: "Sophos", keywords: []string{"sophos"}},
+	{vendor: "Forcepoint", keywords: []string{"forcepoint", "websense"}},
+	{vendor: "Barracuda", keywords: []string{"barracuda"}},
+	{vendor: "SonicWall", keywords: []string{"sonicwall"}},
+	{vendor: "F5 Networks", keywords: []string{"f5 networks", "big-ip"}},
+	{vendor: "Kaspersky", keywords: []string{"kaspersky"}},
+	{vendor: "Trend Micro", keywords: []string{"trend micro"}},
+	{vendor: "Cloudflare Zero Trust", keywords: []string{"cloudflare gateway", "cloudflare for teams"}},
+}
+
+var genericInterceptionKeywords = []string{
+	"ssl inspection", "tls inspection", "forward proxy", "proxy ca",
+	"decryption ca", "inspection ca", "mitm proxy", "content filter",
+	"ssl intercept", "deep packet inspection", "break and inspect",
+}
+
+// DetectTLSInterception analyzes the presented certificate chain for markers
+// of corporate TLS decryption / SSL interception proxies (Netskope, Zscaler, etc.).
+func DetectTLSInterception(certs []*x509.Certificate) (detected bool, vendor string, details string) {
+	if len(certs) == 0 {
+		return false, "", ""
+	}
+
+	matchText := func(text string) (bool, string) {
+		lower := strings.ToLower(text)
+		for _, sig := range knownInterceptionSignatures {
+			for _, kw := range sig.keywords {
+				if strings.Contains(lower, kw) {
+					return true, sig.vendor
+				}
+			}
+		}
+		for _, kw := range genericInterceptionKeywords {
+			if strings.Contains(lower, kw) {
+				return true, "Enterprise Proxy"
+			}
+		}
+		return false, ""
+	}
+
+	// 1. Inspect leaf issuer and organizational units
+	leaf := certs[0]
+	var issuerParts []string
+	if len(leaf.Issuer.Organization) > 0 {
+		issuerParts = append(issuerParts, leaf.Issuer.Organization...)
+	}
+	if leaf.Issuer.CommonName != "" {
+		issuerParts = append(issuerParts, leaf.Issuer.CommonName)
+	}
+	if len(leaf.Issuer.OrganizationalUnit) > 0 {
+		issuerParts = append(issuerParts, leaf.Issuer.OrganizationalUnit...)
+	}
+
+	for _, part := range issuerParts {
+		if matched, v := matchText(part); matched {
+			return true, v, fmt.Sprintf("TLS certificate was minted by enterprise proxy %s (Issuer: %s)", v, strings.Join(issuerParts, ", "))
+		}
+	}
+
+	// 2. Inspect intermediate & root certificates in the chain
+	for i := 1; i < len(certs); i++ {
+		c := certs[i]
+		var cParts []string
+		if len(c.Subject.Organization) > 0 {
+			cParts = append(cParts, c.Subject.Organization...)
+		}
+		if c.Subject.CommonName != "" {
+			cParts = append(cParts, c.Subject.CommonName)
+		}
+		if len(c.Issuer.Organization) > 0 {
+			cParts = append(cParts, c.Issuer.Organization...)
+		}
+		if c.Issuer.CommonName != "" {
+			cParts = append(cParts, c.Issuer.CommonName)
+		}
+		for _, part := range cParts {
+			if matched, v := matchText(part); matched {
+				return true, v, fmt.Sprintf("TLS certificate chain contains enterprise inspection CA %s (%s)", v, part)
+			}
+		}
+	}
+
+	return false, "", ""
+}
 
 func getTLSInfo(domain string, info *DomainInfo) error {
 	tlsInfo, err := InspectTLS(domain)
@@ -29,13 +134,27 @@ func getTLSInfo(domain string, info *DomainInfo) error {
 }
 
 // InspectTLS performs a deep TLS handshake, protocol version enumeration, cipher suite analysis,
-// certificate chain validation, OCSP/CT check, and calculates a security grade (A+ to F).
+// certificate chain validation, OCSP/CT check, enterprise MITM proxy inspection,
+// Certificate Transparency public certificate retrieval, and calculates a security grade (A+ to F).
 func InspectTLS(target string) (TLSInfo, error) {
 	clean := NormalizeTarget(target)
 	if clean == "" {
 		return TLSInfo{}, fmt.Errorf("empty target")
 	}
 	isIP := IsIPAddress(clean)
+
+	// Concurrently query public Certificate Transparency logs for domains
+	var (
+		ctCert *CTCertificate
+		ctWg   sync.WaitGroup
+	)
+	if !isIP {
+		ctWg.Add(1)
+		go func() {
+			defer ctWg.Done()
+			ctCert = FetchPublicCertFromCT(clean)
+		}()
+	}
 
 	conf := &tls.Config{
 		InsecureSkipVerify: true,
@@ -48,6 +167,9 @@ func InspectTLS(target string) (TLSInfo, error) {
 	dialer := &net.Dialer{Timeout: 8 * time.Second}
 	conn, err := tls.DialWithDialer(dialer, "tcp", net.JoinHostPort(clean, "443"), conf)
 	if err != nil {
+		if !isIP {
+			ctWg.Wait()
+		}
 		return TLSInfo{}, err
 	}
 	state := conn.ConnectionState()
@@ -84,6 +206,12 @@ func InspectTLS(target string) (TLSInfo, error) {
 		if hasSCTExtension(leaf) {
 			t.HasCertTransparency = true
 		}
+
+		// Detect enterprise TLS interception / MITM proxies (Netskope, Zscaler, etc.)
+		intercepted, vendor, details := DetectTLSInterception(certs)
+		t.InterceptionDetected = intercepted
+		t.InterceptionVendor = vendor
+		t.InterceptionDetails = details
 
 		// Collect unique SANs (plus Subject CN if domain-like)
 		var sans []string
@@ -134,6 +262,14 @@ func InspectTLS(target string) (TLSInfo, error) {
 	}
 	t.SupportedVersions = supported
 	t.DeprecatedVersions = deprecated
+
+	// Wait for CT lookup to complete for domains, or resolve via first SAN domain for IPs
+	if !isIP {
+		ctWg.Wait()
+		t.PublicCTCert = ctCert
+	} else if len(t.SANDomains) > 0 && !IsIPAddress(t.SANDomains[0]) {
+		t.PublicCTCert = FetchPublicCertFromCT(t.SANDomains[0])
+	}
 
 	EvaluateTLSGrade(&t, isIP)
 	return t, nil
@@ -263,6 +399,11 @@ func EvaluateTLSGrade(t *TLSInfo, isIP bool) {
 	var warnings []string
 	score := 100
 
+	// 0. Enterprise TLS proxy interception warning
+	if t.InterceptionDetected {
+		warnings = append(warnings, fmt.Sprintf("Enterprise TLS Interception active (%s): Certificate presented was generated by an enterprise inspection proxy and does not originate from the real remote server", t.InterceptionVendor))
+	}
+
 	// 1. Certificate expiration & trust chain
 	if t.DaysRemaining < 0 {
 		score = 0
@@ -347,4 +488,365 @@ func EvaluateTLSGrade(t *TLSInfo, isIP bool) {
 		t.Grade = "A"
 		t.GradeSummary = "Strong modern TLS configuration and valid certificate chain"
 	}
+}
+
+// FetchPublicCertFromCT queries public Certificate Transparency logs (crt.sh with CertSpotter fallback)
+// to retrieve the real origin certificate issued for domain by a public Web PKI CA.
+func FetchPublicCertFromCT(domain string) *CTCertificate {
+	clean := CleanDomainTarget(NormalizeTarget(domain))
+	if clean == "" || IsIPAddress(clean) {
+		return nil
+	}
+
+	// 1. Try crt.sh
+	cert, err := fetchCrtShCert(clean)
+	if err == nil && cert != nil {
+		return cert
+	}
+
+	// 2. Fallback to CertSpotter
+	cert, err = fetchCertSpotterCert(clean)
+	if err == nil && cert != nil {
+		return cert
+	}
+
+	return nil
+}
+
+type crtShCertEntry struct {
+	IssuerCaID     int    `json:"issuer_ca_id"`
+	IssuerName     string `json:"issuer_name"`
+	CommonName     string `json:"common_name"`
+	NameValue      string `json:"name_value"`
+	ID             int64  `json:"id"`
+	EntryTimestamp string `json:"entry_timestamp"`
+	NotBefore      string `json:"not_before"`
+	NotAfter       string `json:"not_after"`
+	SerialNumber   string `json:"serial_number"`
+}
+
+func fetchCrtShCert(domain string) (*CTCertificate, error) {
+	client := &http.Client{Timeout: 7 * time.Second}
+	reqURL := fmt.Sprintf("https://crt.sh/?q=%s&output=json", url.QueryEscape(domain))
+	req, err := http.NewRequest("GET", reqURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("User-Agent", wafUserAgent)
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
+	}
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 4*1024*1024))
+	if err != nil {
+		return nil, err
+	}
+
+	return ParseCrtShCertJSON(body, domain)
+}
+
+// ParseCrtShCertJSON parses crt.sh JSON output and extracts the most recent valid public certificate for domain.
+func ParseCrtShCertJSON(body []byte, domain string) (*CTCertificate, error) {
+	var entries []crtShCertEntry
+	if err := json.Unmarshal(body, &entries); err != nil {
+		return nil, err
+	}
+	if len(entries) == 0 {
+		return nil, fmt.Errorf("no CT records found")
+	}
+
+	target := strings.ToLower(strings.TrimSpace(domain))
+	apex, _ := publicsuffix.EffectiveTLDPlusOne(target)
+
+	type scoredCert struct {
+		entry     crtShCertEntry
+		notBefore time.Time
+		notAfter  time.Time
+		isCurrent bool
+		exactHost bool
+	}
+
+	var candidates []scoredCert
+	now := time.Now()
+
+	for _, e := range entries {
+		cnLower := strings.ToLower(strings.TrimSpace(e.CommonName))
+		nvLower := strings.ToLower(e.NameValue)
+
+		matches := false
+		exact := false
+		if cnLower == target || cnLower == "*."+target {
+			matches = true
+			exact = (cnLower == target)
+		} else if strings.Contains(nvLower, target) {
+			lines := strings.Split(nvLower, "\n")
+			for _, line := range lines {
+				line = strings.TrimSpace(line)
+				if line == target {
+					matches = true
+					exact = true
+					break
+				}
+				if line == "*."+target || (apex != "" && (line == apex || line == "*."+apex)) {
+					matches = true
+				}
+			}
+		}
+
+		if !matches {
+			continue
+		}
+
+		nb := parseCTTime(e.NotBefore)
+		na := parseCTTime(e.NotAfter)
+		isCurrent := !nb.IsZero() && !na.IsZero() && now.After(nb) && now.Before(na)
+
+		candidates = append(candidates, scoredCert{
+			entry:     e,
+			notBefore: nb,
+			notAfter:  na,
+			isCurrent: isCurrent,
+			exactHost: exact,
+		})
+	}
+
+	if len(candidates) == 0 {
+		return nil, fmt.Errorf("no matching CT certificate for domain %s", domain)
+	}
+
+	sort.Slice(candidates, func(i, j int) bool {
+		if candidates[i].isCurrent != candidates[j].isCurrent {
+			return candidates[i].isCurrent
+		}
+		if candidates[i].exactHost != candidates[j].exactHost {
+			return candidates[i].exactHost
+		}
+		return candidates[i].notBefore.After(candidates[j].notBefore)
+	})
+
+	best := candidates[0]
+	org, cn := parseX500OrgAndCN(best.entry.IssuerName)
+
+	var sans []string
+	seenSAN := make(map[string]bool)
+	addSAN := func(s string) {
+		s = strings.TrimSpace(s)
+		s = strings.TrimSuffix(s, ".")
+		lower := strings.ToLower(s)
+		if s != "" && !seenSAN[lower] {
+			seenSAN[lower] = true
+			sans = append(sans, s)
+		}
+	}
+	if best.entry.CommonName != "" {
+		addSAN(best.entry.CommonName)
+	}
+	for _, l := range strings.Split(best.entry.NameValue, "\n") {
+		addSAN(l)
+	}
+	sort.Strings(sans)
+
+	daysRemaining := 0
+	if !best.notAfter.IsZero() {
+		daysRemaining = int(math.Floor(time.Until(best.notAfter).Hours() / 24.0))
+	}
+
+	validFromStr := best.entry.NotBefore
+	if !best.notBefore.IsZero() {
+		validFromStr = best.notBefore.UTC().Format(time.RFC3339)
+	}
+	validToStr := best.entry.NotAfter
+	if !best.notAfter.IsZero() {
+		validToStr = best.notAfter.UTC().Format(time.RFC3339)
+	}
+
+	return &CTCertificate{
+		SubjectCN:     best.entry.CommonName,
+		Issuer:        cn,
+		IssuerOrg:     org,
+		ValidFrom:     validFromStr,
+		ValidTo:       validToStr,
+		DaysRemaining: daysRemaining,
+		SerialNumber:  strings.ToUpper(strings.TrimSpace(best.entry.SerialNumber)),
+		SANDomains:    sans,
+		LoggedAt:      best.entry.EntryTimestamp,
+		Source:        "crt.sh (Certificate Transparency)",
+	}, nil
+}
+
+type certSpotterIssuanceEntry struct {
+	ID        string   `json:"id"`
+	DNSNames  []string `json:"dns_names"`
+	NotBefore string   `json:"not_before"`
+	NotAfter  string   `json:"not_after"`
+	Issuer    struct {
+		Name string `json:"name"`
+	} `json:"issuer"`
+}
+
+func fetchCertSpotterCert(domain string) (*CTCertificate, error) {
+	client := &http.Client{Timeout: 7 * time.Second}
+	reqURL := fmt.Sprintf("https://api.certspotter.com/v1/issuances?domain=%s&include_subdomains=false&expand=dns_names&expand=issuer", url.QueryEscape(domain))
+	req, err := http.NewRequest("GET", reqURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("User-Agent", wafUserAgent)
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
+	}
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 2*1024*1024))
+	if err != nil {
+		return nil, err
+	}
+
+	return ParseCertSpotterCertJSON(body, domain)
+}
+
+// ParseCertSpotterCertJSON parses CertSpotter API JSON output and extracts the most recent valid public certificate.
+func ParseCertSpotterCertJSON(body []byte, domain string) (*CTCertificate, error) {
+	var entries []certSpotterIssuanceEntry
+	if err := json.Unmarshal(body, &entries); err != nil {
+		return nil, err
+	}
+	if len(entries) == 0 {
+		return nil, fmt.Errorf("no CertSpotter records")
+	}
+
+	target := strings.ToLower(strings.TrimSpace(domain))
+	now := time.Now()
+
+	type scoredCert struct {
+		entry     certSpotterIssuanceEntry
+		notBefore time.Time
+		notAfter  time.Time
+		isCurrent bool
+	}
+
+	var candidates []scoredCert
+	for _, e := range entries {
+		matches := false
+		for _, name := range e.DNSNames {
+			n := strings.ToLower(strings.TrimSpace(name))
+			if n == target || n == "*."+target {
+				matches = true
+				break
+			}
+		}
+		if !matches {
+			continue
+		}
+
+		nb := parseCTTime(e.NotBefore)
+		na := parseCTTime(e.NotAfter)
+		isCurrent := !nb.IsZero() && !na.IsZero() && now.After(nb) && now.Before(na)
+
+		candidates = append(candidates, scoredCert{
+			entry:     e,
+			notBefore: nb,
+			notAfter:  na,
+			isCurrent: isCurrent,
+		})
+	}
+
+	if len(candidates) == 0 {
+		return nil, fmt.Errorf("no matching CertSpotter certificate for domain %s", domain)
+	}
+
+	sort.Slice(candidates, func(i, j int) bool {
+		if candidates[i].isCurrent != candidates[j].isCurrent {
+			return candidates[i].isCurrent
+		}
+		return candidates[i].notBefore.After(candidates[j].notBefore)
+	})
+
+	best := candidates[0]
+	org, cn := parseX500OrgAndCN(best.entry.Issuer.Name)
+
+	var sans []string
+	seen := make(map[string]bool)
+	for _, s := range best.entry.DNSNames {
+		s = strings.TrimSpace(s)
+		lower := strings.ToLower(s)
+		if s != "" && !seen[lower] {
+			seen[lower] = true
+			sans = append(sans, s)
+		}
+	}
+	sort.Strings(sans)
+
+	daysRemaining := 0
+	if !best.notAfter.IsZero() {
+		daysRemaining = int(math.Floor(time.Until(best.notAfter).Hours() / 24.0))
+	}
+
+	subCN := domain
+	if len(sans) > 0 {
+		subCN = sans[0]
+	}
+
+	return &CTCertificate{
+		SubjectCN:     subCN,
+		Issuer:        cn,
+		IssuerOrg:     org,
+		ValidFrom:     best.entry.NotBefore,
+		ValidTo:       best.entry.NotAfter,
+		DaysRemaining: daysRemaining,
+		SANDomains:    sans,
+		Source:        "CertSpotter (Certificate Transparency)",
+	}, nil
+}
+
+func parseCTTime(s string) time.Time {
+	layouts := []string{
+		time.RFC3339,
+		"2006-01-02T15:04:05",
+		"2006-01-02T15:04:05.999999",
+		"2006-01-02 15:04:05",
+		"2006-01-02",
+	}
+	for _, l := range layouts {
+		if t, err := time.Parse(l, s); err == nil {
+			return t
+		}
+	}
+	return time.Time{}
+}
+
+func parseX500OrgAndCN(issuerDN string) (string, string) {
+	var org, cn string
+	parts := strings.Split(issuerDN, ",")
+	for _, p := range parts {
+		trimmed := strings.TrimSpace(p)
+		if strings.HasPrefix(trimmed, "O=") {
+			org = strings.TrimPrefix(trimmed, "O=")
+			org = strings.Trim(org, "\"")
+		} else if strings.HasPrefix(trimmed, "CN=") {
+			cn = strings.TrimPrefix(trimmed, "CN=")
+			cn = strings.Trim(cn, "\"")
+		}
+	}
+	if org == "" && cn != "" {
+		org = cn
+	} else if org == "" {
+		org = issuerDN
+	}
+	return org, cn
 }

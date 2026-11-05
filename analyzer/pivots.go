@@ -99,6 +99,11 @@ func ExtractDomainPivots(info *DomainInfo) []PivotTarget {
 	for _, san := range info.TLS.SANDomains {
 		addDomain(san, "TLS SAN")
 	}
+	if info.TLS.PublicCTCert != nil {
+		for _, san := range info.TLS.PublicCTCert.SANDomains {
+			addDomain(san, "Public CT SAN")
+		}
+	}
 
 	// 5. MX Records & SPF Includes
 	for _, mx := range info.Email.MXRecords {
@@ -174,6 +179,11 @@ func ExtractIPPivots(info *IPInfo) []PivotTarget {
 
 	for _, san := range info.TLS.SANDomains {
 		addDomain(san, "TLS SAN")
+	}
+	if info.TLS.PublicCTCert != nil {
+		for _, san := range info.TLS.PublicCTCert.SANDomains {
+			addDomain(san, "Public CT SAN")
+		}
 	}
 
 	for _, cname := range info.WAF.CNAMEs {

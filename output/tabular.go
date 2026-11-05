@@ -127,6 +127,9 @@ func (f *TabularFormatter) Format(w io.Writer, info *analyzer.DomainInfo) error 
 	fmt.Fprintln(tw, "==================================================")
 	fmt.Fprintf(tw, "Has TLS\t%v\n", info.TLS.HasTLS)
 	if info.TLS.HasTLS {
+		if info.TLS.InterceptionDetected {
+			fmt.Fprintf(tw, "TLS Interception\t⚠️ ACTIVE [%s] %s\n", info.TLS.InterceptionVendor, info.TLS.InterceptionDetails)
+		}
 		if info.TLS.Grade != "" {
 			fmt.Fprintf(tw, "TLS Security Grade\t[%s] %s\n", info.TLS.Grade, info.TLS.GradeSummary)
 		}
@@ -149,6 +152,13 @@ func (f *TabularFormatter) Format(w io.Writer, info *analyzer.DomainInfo) error 
 			fmt.Fprintf(tw, "TLS Warning\t%s\n", w)
 		}
 		fmt.Fprintf(tw, "SAN Domains\t%s\n", strings.Join(info.TLS.SANDomains, ", "))
+		if info.TLS.PublicCTCert != nil {
+			fmt.Fprintf(tw, "Public Origin CT Cert\t%s (Issuer: %s, Valid to: %s, %d days left, Source: %s)\n",
+				info.TLS.PublicCTCert.SubjectCN, info.TLS.PublicCTCert.IssuerOrg, info.TLS.PublicCTCert.ValidTo, info.TLS.PublicCTCert.DaysRemaining, info.TLS.PublicCTCert.Source)
+			if len(info.TLS.PublicCTCert.SANDomains) > 0 {
+				fmt.Fprintf(tw, "Public CT SANs\t%s\n", strings.Join(info.TLS.PublicCTCert.SANDomains, ", "))
+			}
+		}
 	}
 
 	// --- WEB SECTION ---

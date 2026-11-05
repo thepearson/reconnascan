@@ -114,6 +114,7 @@ func runSystemICMPPing(target, resolvedIP string) (*PingResult, bool) {
 	}
 
 	cmd := exec.CommandContext(ctx, pingBin, args...)
+	prepareCmd(cmd)
 	outBytes, err := cmd.CombinedOutput()
 	raw := strings.TrimSpace(string(outBytes))
 	if raw == "" && err != nil {
@@ -344,6 +345,7 @@ func RunTraceroute(target string) *TracerouteResult {
 			continue
 		}
 		cmd := exec.CommandContext(ctx, binPath, c.args...)
+		prepareCmd(cmd)
 		outBytes, cmdErr := cmd.CombinedOutput()
 		raw := strings.TrimSpace(string(outBytes))
 		if raw == "" && cmdErr != nil {

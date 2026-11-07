@@ -2,7 +2,7 @@
 
 `ReconnaScan` (`rscan` / `rscan-ui`) is a rapid domain and infrastructure reconnaissance tool written in Go. It aggregates information from multiple sources to provide a comprehensive view of a domain or IP's status, infrastructure, and technology stack.
 
-[Download Latest Release](releases/latest)
+[Download Latest Release](releases)
 
 ## Example
 
